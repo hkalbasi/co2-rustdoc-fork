@@ -75,8 +75,6 @@ pub(crate) struct DocContext<'tcx> {
     pub(crate) inlined: FxHashSet<ItemId>,
     /// Used by `calculate_doc_coverage`.
     pub(crate) output_format: OutputFormat,
-    /// Used by `strip_private`.
-    pub(crate) show_coverage: bool,
 }
 
 impl<'tcx> DocContext<'tcx> {
@@ -89,7 +87,15 @@ impl<'tcx> DocContext<'tcx> {
         def_id: DefId,
         f: F,
     ) -> T {
-        let old_param_env = mem::replace(&mut self.param_env, self.tcx.param_env(def_id));
+        self.with_exact_param_env(self.tcx.param_env(def_id), f)
+    }
+
+    pub(crate) fn with_exact_param_env<T, F: FnOnce(&mut Self) -> T>(
+        &mut self,
+        param_env: ParamEnv<'tcx>,
+        f: F,
+    ) -> T {
+        let old_param_env = mem::replace(&mut self.param_env, param_env);
         let ret = f(self);
         self.param_env = old_param_env;
         ret
@@ -139,7 +145,7 @@ impl<'tcx> DocContext<'tcx> {
     ///
     /// If another option like `--show-coverage` is enabled, it will return `false`.
     pub(crate) fn is_json_output(&self) -> bool {
-        self.output_format.is_json() && !self.show_coverage
+        self.output_format == OutputFormat::IrJson
     }
 
     /// If `--document-private-items` was passed to rustdoc.
@@ -235,6 +241,7 @@ pub(crate) fn create_config(
         // it's unclear whether these should be part of rustdoc directly (#77364)
         rustc_lint::builtin::MISSING_DOCS.name.to_string(),
         rustc_lint::builtin::INVALID_DOC_ATTRIBUTES.name.to_string(),
+        rustc_lint::builtin::UNUSED_DOC_COMMENTS.name.to_string(),
         // these are definitely not part of rustdoc, but we want to warn on them anyway.
         rustc_lint::builtin::RENAMED_AND_REMOVED_LINTS.name.to_string(),
         rustc_lint::builtin::UNKNOWN_LINTS.name.to_string(),
@@ -347,7 +354,7 @@ pub(crate) fn run_global_ctxt(
     let expanded_macros = {
         // We need for these variables to be removed to ensure that the `Crate` won't be "stolen"
         // anymore.
-        let (_resolver, krate) = &*tcx.resolver_for_lowering().borrow();
+        let krate = &*tcx.resolver_for_lowering().1.borrow();
 
         source_macro_expansion(&krate, &render_options, output_format, tcx.sess.source_map())
     };
@@ -384,7 +391,6 @@ pub(crate) fn run_global_ctxt(
         cache: Cache::new(render_options.document_private, render_options.document_hidden),
         inlined: FxHashSet::default(),
         output_format,
-        show_coverage,
     };
 
     for cnum in tcx.crates(()) {
