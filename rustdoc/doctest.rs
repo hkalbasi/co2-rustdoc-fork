@@ -224,35 +224,38 @@ pub(crate) fn run(
         let mut krate = rustc_interface::passes::parse(&compiler.sess);
         callbacks.after_crate_root_parsing(compiler, &mut krate);
 
-        let collector = rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
-            callbacks.after_expansion(tcx);
-            let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
-            let opts = scrape_test_config(tcx, crate_name, args_path);
+let (collector, _incr_comp_session) =
+            rustc_interface::create_and_enter_global_ctxt(compiler, krate, |tcx| {
+                callbacks.after_expansion(tcx);
+                let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
+                let opts = scrape_test_config(tcx, crate_name, args_path);
 
-            let hir_collector = HirCollector::new(
-                ErrorCodes::from(compiler.sess.opts.unstable_features.is_nightly_build()),
-                tcx,
-            );
-            let tests = hir_collector.collect_crate();
-            if extract_doctests {
-                let mut collector = extracted::ExtractedDocTests::new();
-                tests.into_iter().for_each(|t| collector.add_test(t, &opts, &options));
+                let hir_collector = HirCollector::new(
+                    ErrorCodes::from(compiler.sess.opts.unstable_features.is_nightly_build()),
+                    tcx,
+                );
+                let tests = hir_collector.collect_crate();
+                if extract_doctests {
+                    let mut collector = extracted::ExtractedDocTests::new();
+                    tests.into_iter().for_each(|t| collector.add_test(t, &opts, &options));
 
-                let stdout = std::io::stdout();
-                let mut stdout = stdout.lock();
-                if let Err(error) = serde_json::ser::to_writer(&mut stdout, &collector) {
-                    eprintln!();
-                    Err(format!("Failed to generate JSON output for doctests: {error:?}"))
+                    let stdout = std::io::stdout();
+                    let mut stdout = stdout.lock();
+                    if let Err(error) = serde_json::ser::to_writer(&mut stdout, &collector) {
+                        eprintln!();
+                        Err(format!("Failed to generate JSON output for doctests: {error:?}"))
+                    } else {
+                        Ok(None)
+                    }
                 } else {
-                    Ok(None)
-                }
-            } else {
-                let mut collector = CreateRunnableDocTests::new(options, opts);
-                tests.into_iter().for_each(|t| collector.add_test(t, Some(compiler.sess.dcx())));
+                    let mut collector = CreateRunnableDocTests::new(options, opts);
+                    tests
+                        .into_iter()
+                        .for_each(|t| collector.add_test(t, Some(compiler.sess.dcx())));
 
-                Ok(Some(collector))
-            }
-        });
+                    Ok(Some(collector))
+                }
+            });
         compiler.sess.dcx().abort_if_errors();
 
         collector
