@@ -137,6 +137,8 @@ declare namespace rustdoc {
         loadDesc: function({descShard: SearchDescShard, descIndex: number}): Promise<string|null>;
         loadedDescShard: function(string, number, string);
         isDisplayed: function(): boolean;
+        searchLoaded: boolean;
+        loadSearch: function();
     }
 
     interface SearchDescShard {
@@ -560,13 +562,21 @@ declare namespace rustdoc {
     type Dir = [string, rustdoc.Dir[], string[]]
 
     /**
-     * Indivitual setting object, used in `settings.js`
+     * Individual setting object, used in `settings.js`.
      */
     interface Setting {
         js_name: string,
         name: string,
         options?: string[],
         default: string | boolean,
+    }
+
+    /**
+     * Individual settings tab, used in `settings.js`.
+     */
+    interface SettingsTab {
+        name: string,
+        settings: Array<rustdoc.Setting>,
     }
 
     /**

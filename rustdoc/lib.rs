@@ -6,14 +6,16 @@
 )]
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
+#![feature(default_field_values)]
 #![feature(deref_patterns)]
+#![feature(exitcode_exit_method)]
 #![feature(file_buffered)]
 #![feature(formatting_options)]
 #![feature(iter_intersperse)]
 #![feature(iter_order_by)]
+#![feature(iter_partition_in_place)]
 #![feature(rustc_private)]
 #![feature(test)]
-#![feature(trim_prefix_suffix)]
 #![feature(variant_count)]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
@@ -31,6 +33,7 @@
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
+extern crate rustc_attr_ir;
 extern crate rustc_attr_parsing;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -44,7 +47,6 @@ extern crate rustc_infer;
 extern crate rustc_interface;
 extern crate rustc_lexer;
 extern crate rustc_lint;
-extern crate rustc_lint_defs;
 extern crate rustc_log;
 extern crate rustc_macros;
 extern crate rustc_metadata;
@@ -55,6 +57,7 @@ extern crate rustc_resolve;
 extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_target;
 extern crate rustc_trait_selection;
 extern crate test;
@@ -564,6 +567,14 @@ pub fn opts() -> Vec<RustcOptGroup> {
             "Comma separated list of types of output for rustdoc to emit",
             "[html-static-files,html-non-static-files,dep-info]",
         ),
+        opt(
+            Unstable,
+            Multi,
+            "",
+            "print",
+            "Rustdoc information to print on stdout (or to a file)",
+            "<INFO>[=<FILE>]",
+        ),
         opt(Unstable, FlagMulti, "", "no-run", "Compile doctests without running them", ""),
         opt(
             Unstable,
@@ -863,6 +874,10 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String], callbacks: &mut 
     let input = match input {
         config::InputMode::HasFile(input) => input,
         config::InputMode::NoInputMergeFinalize => {
+            if !options.prints.is_empty() {
+                dcx.fatal("`--print` is not supported for the `--write-doc-meta-dir` option");
+            }
+
             let config = core::create_config(
                 Input::Str {
                     name: rustc_span::FileName::Custom(String::new()),
@@ -880,33 +895,54 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String], callbacks: &mut 
             );
         }
     };
+    let md_input = config::markdown_input(&input);
 
-    let output_format = options.output_format;
+    if options.should_test || options.output_format == config::OutputFormat::Doctest {
+        if !options.prints.is_empty() {
+            dcx.fatal(format!(
+                "`--print` is not yet supported for the `{}` option",
+                if options.should_test { "--test" } else { "--output-format=doctest" }
+            ));
+        }
 
-    match (
-        options.should_test || output_format == config::OutputFormat::Doctest,
-        config::markdown_input(&input),
-    ) {
-        (true, Some(_)) => return wrap_return(dcx, doctest::test_markdown(&input, options, dcx)),
-        (true, None) => return doctest::run(dcx, input, options, callbacks),
-        (false, Some(md_input)) => {
+        return match md_input {
+            Some(_) => wrap_return(dcx, doctest::test_markdown(&input, options, dcx)),
+            None => doctest::run(dcx, input, options, callbacks),
+        };
+    }
+
+    if let Some(md_input) = md_input {
+        if !options.prints.is_empty() {
+            dcx.fatal("`--print` is not yet supported for standalone Markdown files");
+        }
+
+        return {
             let md_input = md_input.to_owned();
             let edition = options.edition;
             let mut config = core::create_config(input, options, &render_options);
             callbacks.config(&mut config);
+            let registered_lints = config.register_lints.is_some();
 
             // `markdown::render` can invoke `doctest::make_test`, which
             // requires session globals and a thread pool, so we use
             // `run_compiler`.
-            return wrap_return(
+            wrap_return(
                 dcx,
                 interface::run_compiler(config, |compiler| {
+                    let sess = &compiler.sess;
+
+                    // -W help
+                    if sess.opts.describe_lints {
+                        rustc_driver::describe_lints(sess, registered_lints);
+                        return Ok(());
+                    }
+
                     // construct a phony "crate" without actually running the parser
                     // allows us to use other compiler infrastructure like dep-info
-                    let file =
-                        compiler.sess.source_map().load_file(&md_input).map_err(|e| {
-                            format!("{md_input}: {e}", md_input = md_input.display())
-                        })?;
+                    let file = sess
+                        .source_map()
+                        .load_file(&md_input)
+                        .map_err(|e| format!("{md_input}: {e}", md_input = md_input.display()))?;
                     let inner_span = Span::new(
                         file.start_pos,
                         BytePos(file.start_pos.0 + file.normalized_source_len.0),
@@ -939,9 +975,8 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String], callbacks: &mut 
                         });
                     res
                 }),
-            );
-        }
-        (false, None) => {}
+            )
+        };
     }
 
     // need to move these items separately because we lose them by the time the closure is called,
@@ -976,8 +1011,16 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String], callbacks: &mut 
             let _ = sess.source_map().load_binary_file(external_path);
         }
 
+        // -W help
         if sess.opts.describe_lints {
             rustc_driver::describe_lints(sess, registered_lints);
+            return;
+        }
+
+        // --print
+        if rustc_driver::print_crate_info(&*compiler.codegen_backend, sess, true)
+            == rustc_driver::Compilation::Stop
+        {
             return;
         }
 
@@ -1006,8 +1049,6 @@ fn main_args(early_dcx: &mut EarlyDiagCtxt, at_args: &[String], callbacks: &mut 
             }
 
             cache.crate_version = crate_version;
-
-            rustc_interface::passes::emit_delayed_lints(tcx);
 
             if render_opts.dep_info().is_some() {
                 rustc_interface::passes::write_dep_info(tcx);

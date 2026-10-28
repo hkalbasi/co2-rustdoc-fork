@@ -7,16 +7,18 @@ use std::{fmt, io};
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::DiagCtxtHandle;
+use rustc_lint::Level;
 use rustc_session::config::{
-    self, CodegenOptions, CrateType, ErrorOutputType, Externs, Input, JsonUnusedExterns,
-    OptionsTargetModifiers, OutFileName, Sysroot, UnstableOptions, get_cmd_lint_options,
-    nightly_options, parse_crate_types_from_list, parse_externs, parse_target_triple,
+    self, CodegenOptions, ErrorOutputType, Externs, Input, JsonUnusedExterns,
+    OptionsTargetModifiers, OutFileName, PrintCategory, PrintRequest, Sysroot, UnstableOptions,
+    collect_print_requests, get_cmd_lint_options, nightly_options, parse_crate_types_from_list,
+    parse_externs, parse_target_triple,
 };
-use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
 use rustc_session::{EarlyDiagCtxt, getopts};
 use rustc_span::edition::Edition;
 use rustc_span::{FileName, RemapPathScopeComponents};
+use rustc_structures::CrateType;
 use rustc_target::spec::TargetTuple;
 use smallvec::SmallVec;
 
@@ -25,7 +27,6 @@ use crate::externalfiles::ExternalHtml;
 use crate::html::markdown::IdMap;
 use crate::html::render::StylePath;
 use crate::html::static_files;
-use crate::passes::{self, Condition};
 use crate::scrape_examples::{AllCallLocations, ScrapeExamplesOptions};
 use crate::{html, opts, theme};
 
@@ -105,6 +106,8 @@ pub(crate) struct Options {
     pub(crate) describe_lints: bool,
     /// What level to cap lints at.
     pub(crate) lint_cap: Option<Level>,
+    /// Print requests to hand to the compiler.
+    pub(crate) prints: Vec<PrintRequest>,
 
     // Options specific to running doctests
     /// Whether we should run doctests instead of generating docs.
@@ -126,8 +129,10 @@ pub(crate) struct Options {
     pub(crate) no_run: bool,
     /// What sources are being mapped.
     pub(crate) remap_path_prefix: Vec<(PathBuf, PathBuf)>,
+    pub(crate) remap_path_prefix_strs: Vec<String>,
     /// Which scope(s) to use with `--remap-path-prefix`
     pub(crate) remap_path_scope: RemapPathScopeComponents,
+    pub(crate) remap_path_scope_str: Option<String>,
 
     /// The path to a rustc-like binary to build tests with. If not set, we
     /// default to loading from `$sysroot/bin/rustc`.
@@ -198,6 +203,7 @@ impl fmt::Debug for Options {
             .field("lint_opts", &self.lint_opts)
             .field("describe_lints", &self.describe_lints)
             .field("lint_cap", &self.lint_cap)
+            .field("prints", &self.prints)
             .field("should_test", &self.should_test)
             .field("test_args", &self.test_args)
             .field("test_run_directory", &self.test_run_directory)
@@ -336,7 +342,6 @@ impl FromStr for EmitType {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            // modern choices
             "html-static-files" => Ok(Self::HtmlStaticFiles),
             "html-non-static-files" => Ok(Self::HtmlNonStaticFiles),
             "dep-info" => Ok(Self::DepInfo(None)),
@@ -409,7 +414,7 @@ impl Options {
         let diagnostic_width = matches.opt_get("diagnostic-width").unwrap_or_default();
 
         let mut collected_options = Default::default();
-        let codegen_options = CodegenOptions::build(early_dcx, matches, &mut collected_options);
+        let mut codegen_options = CodegenOptions::build(early_dcx, matches, &mut collected_options);
         let unstable_opts = UnstableOptions::build(early_dcx, matches, &mut collected_options);
 
         let remap_path_prefix = match parse_remap_path_prefix(matches) {
@@ -427,40 +432,7 @@ impl Options {
         // check for deprecated options
         check_deprecated_options(matches, dcx);
 
-        if matches.opt_strs("passes") == ["list"] {
-            println!("Available passes for running rustdoc:");
-            for pass in passes::PASSES {
-                println!("{:>20} - {}", pass.name, pass.description);
-            }
-            println!("\nDefault passes for rustdoc:");
-            for p in passes::DEFAULT_PASSES {
-                print!("{:>20}", p.pass.name);
-                println_condition(p.condition);
-            }
-
-            if nightly_options::match_is_nightly_build(matches) {
-                println!("\nPasses run with `--show-coverage`:");
-                for p in passes::COVERAGE_PASSES {
-                    print!("{:>20}", p.pass.name);
-                    println_condition(p.condition);
-                }
-            }
-
-            fn println_condition(condition: Condition) {
-                use Condition::*;
-                match condition {
-                    Always => println!(),
-                    WhenDocumentPrivate => println!("  (when --document-private-items)"),
-                    WhenNotDocumentPrivate => println!("  (when not --document-private-items)"),
-                    WhenNotDocumentHidden => println!("  (when not --document-hidden-items)"),
-                }
-            }
-
-            return None;
-        }
-
         let should_test = matches.opt_present("test");
-
         let show_coverage = matches.opt_present("show-coverage");
         let output_format_s = matches.opt_str("output-format");
         let output_format = match output_format_s.as_deref() {
@@ -480,7 +452,7 @@ impl Options {
         match (
             output_format_s.as_ref().map(|_| output_format),
             show_coverage,
-            nightly_options::is_unstable_enabled(matches),
+            nightly_options::unstable_options_enabled(matches),
         ) {
             (None | Some(OutputFormat::CoverageJson), true, _) => {}
             (_, true, _) => {
@@ -603,6 +575,14 @@ impl Options {
             Ok(ex) => ex,
             Err(err) => dcx.fatal(err),
         };
+
+        let prints = collect_print_requests(
+            early_dcx,
+            &mut codegen_options,
+            &unstable_opts,
+            matches,
+            &[PrintCategory::Target, PrintCategory::Crate],
+        );
 
         let mut parts_out_dir =
             match matches.opt_str("write-doc-meta-dir").map(PathToParts::from_flag).transpose() {
@@ -774,12 +754,12 @@ impl Options {
                 if !theme_file.is_file() {
                     dcx.struct_fatal(format!("invalid argument: \"{theme_s}\""))
                         .with_help("arguments to --theme must be files")
-                        .emit();
+                        .emit_fatal();
                 }
                 if theme_file.extension() != Some(OsStr::new("css")) {
                     dcx.struct_fatal(format!("invalid argument: \"{theme_s}\""))
                         .with_help("arguments to --theme must have a .css extension")
-                        .emit();
+                        .emit_fatal();
                 }
                 let (success, ret) = theme::test_theme_against(&theme_file, &paths, dcx);
                 if !success {
@@ -799,7 +779,7 @@ impl Options {
             }
         }
 
-        let edition = config::parse_crate_edition(early_dcx, matches);
+        let edition = config::parse_crate_edition(early_dcx, matches, true);
 
         let mut id_map = html::markdown::IdMap::new();
         let Some(external_html) = ExternalHtml::load(
@@ -879,6 +859,8 @@ impl Options {
         let unstable_opts_strs = matches.opt_strs("Z");
         let lib_strs = matches.opt_strs("L");
         let extern_strs = matches.opt_strs("extern");
+        let remap_path_prefix_strs = matches.opt_strs("remap-path-prefix");
+        let remap_path_scope_str = matches.opt_str("remap-path-scope");
         let test_runtool = matches.opt_str("test-runtool");
         let test_runtool_args = matches.opt_strs("test-runtool-arg");
         let document_private = matches.opt_present("document-private-items");
@@ -939,6 +921,7 @@ impl Options {
             lint_opts,
             describe_lints,
             lint_cap,
+            prints,
             should_test,
             test_args,
             show_coverage,
@@ -953,13 +936,15 @@ impl Options {
             no_run,
             test_builder_wrappers,
             remap_path_prefix,
+            remap_path_prefix_strs,
             remap_path_scope,
+            remap_path_scope_str,
             no_capture,
             crate_name,
             output_format,
             json_unused_externs,
             scrape_examples_options,
-            unstable_features,
+            unstable_features: unstable_features.clone(),
             doctest_build_args,
             target_modifiers: collected_options.target_modifiers,
         };
